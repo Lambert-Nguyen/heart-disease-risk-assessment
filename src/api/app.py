@@ -5,7 +5,7 @@ This Flask API provides endpoints for predicting heart disease severity
 based on clinical patient data using trained machine learning models.
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Blueprint
 from flask_cors import CORS
 import numpy as np
 import pandas as pd
@@ -17,45 +17,8 @@ from typing import Dict, Any, Tuple
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend integration
 
-# Define HierarchicalClassifier class (needed for unpickling)
-class HierarchicalClassifier:
-    """Hierarchical classifier that combines binary and multi-class models."""
-    def __init__(self, binary_model, multiclass_model):
-        self.binary_model = binary_model
-        self.multiclass_model = multiclass_model
-        self.is_ordinal = 'Ordinal' in str(type(multiclass_model))
-
-    def predict(self, X):
-        # Stage 1: Binary prediction
-        binary_pred = self.binary_model.predict(X)
-
-        # Stage 2: Multi-class prediction for disease cases
-        disease_mask = binary_pred == 1
-        final_pred = np.zeros(len(X), dtype=int)
-
-        if disease_mask.sum() > 0:
-            multi_pred = self.multiclass_model.predict(X[disease_mask])
-            # Handle ordinal models if needed
-            if self.is_ordinal:
-                multi_pred = np.clip(np.round(np.nan_to_num(multi_pred, nan=1.0)), 0, 2).astype(int)
-
-            # Map predictions: 0 stays 0, disease cases get their multi-class predictions
-            final_pred[disease_mask] = multi_pred
-
-        return final_pred
-
-    def predict_proba(self, X):
-        """Get probability estimates if available."""
-        if hasattr(self.multiclass_model, 'predict_proba'):
-            return self.multiclass_model.predict_proba(X)
-        else:
-            # Return one-hot encoded predictions if probabilities not available
-            predictions = self.predict(X)
-            n_classes = 3  # No Disease, Mild, Severe
-            proba = np.zeros((len(X), n_classes))
-            for i, pred in enumerate(predictions):
-                proba[i, pred] = 1.0
-            return proba
+# Create API blueprint
+api = Blueprint('api', __name__, url_prefix='/api')
 
 # Global variables for models and preprocessing artifacts
 model = None
@@ -66,6 +29,90 @@ hierarchical_model = None
 # Model directory path
 MODEL_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'models')
 ARTIFACT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'processed')
+
+
+class HierarchicalClassifier:
+    """
+    Hierarchical classifier that performs two-stage prediction:
+    1. Binary classification (disease vs no disease)
+    2. Multi-class classification (severity levels) for disease cases
+    """
+    def __init__(self, binary_model, multiclass_model):
+        self.binary_model = binary_model
+        self.multiclass_model = multiclass_model
+        self.is_ordinal = 'Ordinal' in str(type(multiclass_model))
+
+    def predict(self, X):
+        """Perform hierarchical prediction."""
+        # Stage 1: Binary prediction
+        binary_pred = self.binary_model.predict(X)
+
+        # Stage 2: Multi-class prediction for disease cases
+        disease_mask = binary_pred == 1
+        final_pred = np.zeros(len(X), dtype=int)
+
+        if disease_mask.sum() > 0:
+            if self.is_ordinal:
+                # For ordinal models
+                multi_pred_raw = self.multiclass_model.predict(X[disease_mask])
+                multi_pred = np.clip(np.round(np.nan_to_num(multi_pred_raw, nan=1.0)), 0, 2).astype(int)
+            else:
+                multi_pred = self.multiclass_model.predict(X[disease_mask])
+
+            # Map predictions: 0 stays 0, disease cases get their multi-class predictions
+            final_pred[disease_mask] = multi_pred
+
+        return final_pred
+
+    def predict_proba(self, X):
+        """
+        Predict class probabilities.
+        Combines binary and multi-class probabilities for hierarchical approach.
+        
+        Methodology:
+        - Class 0 (No Disease): P(no disease from binary model)
+        - Class 1 (Mild): P(disease from binary) × P(class 1 from multi-class)
+        - Class 2 (Severe): P(disease from binary) × P(class 2 from multi-class)
+        """
+        # Stage 1: Binary prediction probabilities
+        binary_proba = self.binary_model.predict_proba(X)
+        
+        # Initialize final probabilities for 3 classes
+        final_proba = np.zeros((len(X), 3))
+        
+        # Probability of no disease (class 0) comes directly from binary model
+        final_proba[:, 0] = binary_proba[:, 0]
+        
+        # For disease cases, distribute probability among severity classes
+        if hasattr(self.multiclass_model, 'predict_proba'):
+            # Get multi-class probabilities
+            multi_proba = self.multiclass_model.predict_proba(X)
+            
+            # The multi-class model predicts among classes 0, 1, 2
+            # But in hierarchical context, we only want classes 1 and 2
+            # Distribute disease probability across severity classes 1 and 2
+            if multi_proba.shape[1] == 3:
+                # Multi-class model has 3 classes (0, 1, 2)
+                # Renormalize classes 1 and 2 to distribute disease probability
+                severity_proba = multi_proba[:, 1:3]  # Extract classes 1 and 2
+                severity_sum = severity_proba.sum(axis=1, keepdims=True)
+                severity_sum = np.where(severity_sum == 0, 1, severity_sum)  # Avoid division by zero
+                severity_proba_normalized = severity_proba / severity_sum
+                
+                # Distribute disease probability
+                final_proba[:, 1] = binary_proba[:, 1] * severity_proba_normalized[:, 0]
+                final_proba[:, 2] = binary_proba[:, 1] * severity_proba_normalized[:, 1]
+            else:
+                # Fallback: equal distribution if shape is unexpected
+                final_proba[:, 1] = binary_proba[:, 1] * 0.5
+                final_proba[:, 2] = binary_proba[:, 1] * 0.5
+        else:
+            # If multi-class model doesn't support predict_proba, use predictions
+            predictions = self.predict(X)
+            for i in range(len(X)):
+                final_proba[i, predictions[i]] = binary_proba[i, 1] if predictions[i] > 0 else binary_proba[i, 0]
+        
+        return final_proba
 
 def load_models():
     """Load trained models and preprocessing artifacts."""
@@ -115,9 +162,9 @@ def validate_input(data: Dict[str, Any]) -> Tuple[bool, str]:
     ]
     
     # Check required fields
-    for field in required_fields:
-        if field not in data:
-            return False, f"Missing required field: {field}"
+    missing_fields = [field for field in required_fields if field not in data]
+    if missing_fields:
+        return False, f"Missing required fields: {', '.join(missing_fields)}"
     
     # Validate numeric ranges
     numeric_validations = {
@@ -151,7 +198,7 @@ def validate_input(data: Dict[str, Any]) -> Tuple[bool, str]:
     
     for field, valid_values in categorical_validations.items():
         if data[field] not in valid_values:
-            return False, f"Field '{field}' has invalid value. Valid values: {valid_values}"
+            return False, f"Invalid value for '{field}'. Valid values: {', '.join(map(str, valid_values))}"
     
     return True, ""
 
@@ -233,7 +280,7 @@ def preprocess_input(data: Dict[str, Any]) -> pd.DataFrame:
     return df_scaled
 
 
-def get_recommendation(prediction: int, confidence: float) -> Tuple[str, str]:
+def get_recommendation(prediction: int, confidence: float) -> Dict[str, Any]:
     """
     Generate clinical recommendation based on prediction.
     
@@ -242,45 +289,72 @@ def get_recommendation(prediction: int, confidence: float) -> Tuple[str, str]:
         confidence: Model confidence score
         
     Returns:
-        Tuple of (risk_level, recommendation_text)
+        Dictionary with risk_category, risk_color, and action_items
     """
-    class_names = metadata['class_names']
-    
     if prediction == 0:
-        risk_level = "low"
-        recommendation = (
-            "Your assessment indicates no significant heart disease risk. "
-            "Continue maintaining a healthy lifestyle with regular exercise and balanced diet. "
-            "Schedule routine check-ups as recommended by your healthcare provider."
-        )
+        risk_category = "No Disease"
+        risk_color = "#4CAF50"  # Green
+        action_items = [
+            "Congratulations! Your assessment indicates no significant heart disease risk",
+            "Continue maintaining a healthy lifestyle with regular exercise (150+ minutes/week)",
+            "Follow a heart-healthy diet rich in fruits, vegetables, whole grains, and lean proteins",
+            "Monitor your blood pressure and cholesterol levels annually",
+            "Avoid smoking and limit alcohol consumption",
+            "Maintain a healthy weight (BMI 18.5-24.9)",
+            "Schedule routine check-ups with your primary care physician as recommended",
+            "Stay aware of family history and inform your doctor of any changes"
+        ]
     elif prediction == 1:
-        risk_level = "moderate"
-        recommendation = (
-            "Your assessment indicates mild heart disease. "
-            "Consult with a cardiologist for further evaluation. "
-            "Lifestyle modifications including diet, exercise, and stress management are recommended. "
-            "Follow your doctor's advice regarding medication and monitoring."
-        )
+        risk_category = "Mild-Moderate"
+        risk_color = "#FF9800"  # Orange
+        action_items = [
+            "Your assessment indicates mild-to-moderate heart disease risk",
+            "Schedule a consultation with a cardiologist within 1-2 weeks for further evaluation",
+            "Discuss stress testing, echocardiogram, or other diagnostic tests with your doctor",
+            "Implement lifestyle modifications: heart-healthy diet, regular exercise, stress reduction",
+            "Monitor symptoms: chest discomfort, shortness of breath, fatigue, irregular heartbeat",
+            "Consider cardiac rehabilitation programs if recommended by your physician",
+            "Follow prescribed medications exactly as directed",
+            "Avoid strenuous activity until cleared by your cardiologist",
+            "Keep a symptom diary to share with your healthcare provider",
+            "Reduce risk factors: quit smoking, manage diabetes, control blood pressure/cholesterol"
+        ]
+        
+        if confidence < 0.6:
+            action_items.append(
+                "Note: Prediction confidence is moderate. Additional diagnostic testing recommended for confirmation"
+            )
     else:  # prediction == 2
-        risk_level = "high"
-        recommendation = (
-            "Your assessment indicates severe heart disease requiring immediate medical attention. "
-            "Please consult with a cardiologist as soon as possible for comprehensive evaluation and treatment. "
-            "Do not delay seeking medical care. "
-            "Follow all medical advice and prescribed treatments carefully."
-        )
+        risk_category = "Severe-Critical"
+        risk_color = "#E91E63"  # Red-Pink
+        action_items = [
+            "URGENT: Your assessment indicates severe heart disease requiring immediate medical attention",
+            "Contact a cardiologist IMMEDIATELY for urgent consultation (within 24-48 hours)",
+            "Do not delay - severe risk factors detected that require prompt evaluation",
+            "Avoid strenuous physical activity until medically evaluated",
+            "Monitor for acute symptoms: severe chest pain, shortness of breath, dizziness, fainting",
+            "Keep a detailed symptom diary (chest pain, breathing difficulty, fatigue, swelling)",
+            "Have someone accompany you to medical appointments",
+            "Bring complete medical history, current medications, and this assessment to your appointment",
+            "If experiencing acute symptoms (severe chest pain, shortness of breath, profuse sweating), call 911 immediately",
+            "Do not drive yourself if experiencing symptoms - call emergency services",
+            "Discuss immediate treatment options: medications, procedures, lifestyle changes",
+            "Consider getting a second opinion from a cardiac specialist"
+        ]
+        
+        if confidence < 0.6:
+            action_items.append(
+                "Note: While confidence is moderate, the severity prediction warrants immediate medical attention regardless"
+            )
     
-    # Adjust for low confidence
-    if confidence < 0.6:
-        recommendation += (
-            " Note: The prediction confidence is relatively low. "
-            "Additional testing may be needed for more accurate assessment."
-        )
-    
-    return risk_level, recommendation
+    return {
+        'risk_category': risk_category,
+        'risk_color': risk_color,
+        'action_items': action_items
+    }
 
 
-@app.route('/api/health', methods=['GET'])
+@api.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint."""
     return jsonify({
@@ -290,7 +364,7 @@ def health_check():
     })
 
 
-@app.route('/api/predict', methods=['POST'])
+@api.route('/predict', methods=['POST'])
 def predict():
     """
     Main prediction endpoint.
@@ -311,6 +385,8 @@ def predict():
         "ca": 0.0,
         "thal": "fixed defect"
     }
+    
+    Returns success response with prediction, confidence, probabilities, and action items.
     """
     try:
         # Get JSON data
@@ -318,54 +394,70 @@ def predict():
         
         if not data:
             return jsonify({
-                'error': 'No input data provided',
-                'details': 'Request body must contain JSON data'
+                'success': False,
+                'error': 'No input data provided'
             }), 400
         
         # Validate input
         is_valid, error_msg = validate_input(data)
         if not is_valid:
             return jsonify({
-                'error': 'Invalid input',
-                'details': error_msg
+                'success': False,
+                'error': error_msg
             }), 400
         
         # Preprocess input
         processed_data = preprocess_input(data)
         
-        # Make prediction
+        # Make prediction and get probabilities
         if hasattr(model, 'predict_proba'):
             prediction_proba = model.predict_proba(processed_data)[0]
             prediction = int(np.argmax(prediction_proba))
             confidence = float(prediction_proba[prediction])
+            
+            # Create probabilities dictionary
+            probabilities = {
+                "0": round(float(prediction_proba[0]), 4),
+                "1": round(float(prediction_proba[1]), 4),
+                "2": round(float(prediction_proba[2]), 4)
+            }
         else:
             # For hierarchical or ordinal models without predict_proba
             prediction = int(model.predict(processed_data)[0])
             confidence = 0.75  # Default confidence for models without probability estimates
+            
+            # Create uniform probabilities as fallback
+            probabilities = {
+                "0": 0.0,
+                "1": 0.0,
+                "2": 0.0
+            }
+            probabilities[str(prediction)] = confidence
         
-        # Get prediction label
-        prediction_label = metadata['class_names'][prediction]
+        # Get recommendation details
+        recommendation_data = get_recommendation(prediction, confidence)
         
-        # Generate recommendation
-        risk_level, recommendation = get_recommendation(prediction, confidence)
-        
-        # Return response
+        # Return success response
         return jsonify({
-            'prediction': prediction,
-            'prediction_label': prediction_label,
-            'confidence': round(confidence, 4),
-            'risk_level': risk_level,
-            'recommendation': recommendation
-        })
+            'success': True,
+            'data': {
+                'prediction': prediction,
+                'confidence': round(confidence, 4),
+                'probabilities': probabilities,
+                'risk_category': recommendation_data['risk_category'],
+                'risk_color': recommendation_data['risk_color'],
+                'action_items': recommendation_data['action_items']
+            }
+        }), 200
         
     except Exception as e:
         return jsonify({
-            'error': 'Prediction failed',
-            'details': str(e)
+            'success': False,
+            'error': f'Prediction failed: {str(e)}'
         }), 500
 
 
-@app.route('/api/model-info', methods=['GET'])
+@api.route('/model-info', methods=['GET'])
 def model_info():
     """Return information about the loaded model."""
     if metadata is None:
@@ -387,8 +479,8 @@ def model_info():
 def not_found(error):
     """Handle 404 errors."""
     return jsonify({
-        'error': 'Endpoint not found',
-        'details': 'The requested endpoint does not exist'
+        'success': False,
+        'error': 'Endpoint not found'
     }), 404
 
 
@@ -396,12 +488,15 @@ def not_found(error):
 def internal_error(error):
     """Handle 500 errors."""
     return jsonify({
-        'error': 'Internal server error',
-        'details': 'An unexpected error occurred'
+        'success': False,
+        'error': 'Internal server error'
     }), 500
 
 
 if __name__ == '__main__':
+    # Register API blueprint
+    app.register_blueprint(api)
+
     # Load models on startup
     print("Loading models...")
     if load_models():
