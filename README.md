@@ -1,9 +1,9 @@
 # Heart Disease Risk Assessment System
 
-**CMPE 257 - Machine Learning (Fall 2025)**
+**CMPE 257 - Machine Learning (Fall 2025)**  
 San Jose State University
 
-**Team**: Lam Nguyen, James Pham, Le Duy Vu, Vi Thi Tuong Nguyen
+**Team**:  Lam Nguyen, James Pham, Le Duy Vu, Vi Thi Tuong Nguyen
 
 ---
 
@@ -137,7 +137,7 @@ npm run dev
 ## Project Structure
 
 ```
-heart-disease-risk-assessment-1/
+heart-disease-risk-assessment/
 │
 ├── 📓 notebooks/
 │   ├── 01_exploratory_data_analysis.ipynb  EDA & visualization
@@ -192,7 +192,7 @@ heart-disease-risk-assessment-1/
 ### Dataset
 - **Source**: UCI Heart Disease (4 medical centers)
 - **Size**: 920 patients
-- **Features**: 14 clinical attributes → 18 after engineering
+- **Features**: 14 clinical attributes → 18 after feature engineering
 - **Classes**: 3 severity groups (0: No Disease, 1: Mild Disease, 2: Severe Disease)
 - **Original Challenge**: Extreme class imbalance (329:299:108 distribution)
 - **Solution**: Hierarchical approach (Binary detection → Severity classification)
